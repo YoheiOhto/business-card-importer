@@ -23,7 +23,7 @@ class FakeReader:
         result = self.cards[path.name]
         if isinstance(result, Exception):
             raise result
-        return result
+        return result, f"{result['name']}\n全文"
 
 
 class SyncTest(unittest.TestCase):
@@ -52,11 +52,14 @@ class SyncTest(unittest.TestCase):
         })
         saved = []
 
-        def register(value):
+        def register(value, attachment):
             saved.append(value)
+            jpeg, filename, full_text = attachment
+            self.assertTrue(jpeg.startswith(b"\xff\xd8"))
+            self.assertEqual(full_text, f"{value['name']}\n全文")
             if value["name"] == "佐藤 一郎":
-                return "duplicate", "https://notion.so/old"
-            return "created", "https://notion.so/new"
+                return "duplicate", "https://notion.so/old", "old-id"
+            return "created", "https://notion.so/new", "new-id"
 
         counts = self.run_sync(reader, register)
         self.assertEqual((counts["created"], counts["duplicate"], counts["skipped"]), (1, 1, 1))
@@ -73,17 +76,18 @@ class SyncTest(unittest.TestCase):
         self.image("blank.jpg", "black")
         reader = FakeReader({"a.jpg": card(company="架空商事"), "blank.jpg": card(name="")})
 
-        def register(_value):
+        def register(_value, _attachment):
             raise AssertionError("dry run must not register")
 
         counts = self.run_sync(reader, register, dry_run=True)
         self.assertEqual((counts["read"], counts["failed"]), (1, 1))
         self.assertFalse((self.data / "synced.json").exists())
         self.assertIn("    会社名: 架空商事", self.lines)
+        self.assertIn("      全文", self.lines)
 
-        counts = self.run_sync(reader, lambda value: ("created", "https://notion.so/new"))
+        counts = self.run_sync(reader, lambda value, attachment: ("created", "https://notion.so/new", "new-id"))
         self.assertEqual((counts["created"], counts["failed"]), (1, 1))
-        counts = self.run_sync(reader, lambda value: ("created", "https://notion.so/new"))
+        counts = self.run_sync(reader, lambda value, attachment: ("created", "https://notion.so/new", "new-id"))
         self.assertEqual((counts["skipped"], counts["failed"]), (1, 1))
 
     def test_settings_error_stops_and_uncertain_create_is_not_retried(self):
@@ -91,14 +95,14 @@ class SyncTest(unittest.TestCase):
         self.image("b.jpg", "gray")
         reader = FakeReader({"a.jpg": card(), "b.jpg": card(name="佐藤 一郎")})
 
-        def broken(_value):
+        def broken(_value, _attachment):
             raise CardError("notion.local.json に登録先のデータソース ID と列名を設定してください。", 503)
 
         counts = self.run_sync(reader, broken)
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(len(reader.calls), 1)
 
-        def lost(_value):
+        def lost(_value, _attachment):
             raise CardError("登録結果を確認できませんでした。Notion で登録済みか確かめてから再試行してください。", 502)
 
         counts = self.run_sync(reader, lost)
@@ -110,13 +114,36 @@ class SyncTest(unittest.TestCase):
         for index, color in enumerate(("white", "gray", "black")):
             self.image(f"{index}.jpg", color)
         reader = FakeReader({f"{index}.jpg": card(name=f"名前{index}") for index in range(3)})
-        register = lambda value: ("created", "https://notion.so/new")
+        register = lambda value, attachment: ("created", "https://notion.so/new", "new-id")
 
         counts = self.run_sync(reader, register, limit=2)
         self.assertEqual((counts["created"], counts["left"]), (2, 1))
         counts = self.run_sync(reader, register, limit=2)
         self.assertEqual((counts["created"], counts["skipped"], counts["left"]), (1, 2, 0))
         self.assertEqual(reader.calls, ["0.jpg", "1.jpg", "2.jpg"])
+
+    def test_rows_created_without_body_get_photo_and_text_once(self):
+        self.image("a.jpg", "white")
+        page = "41b227d008f181d2a577f0677a51d812"
+        self.data.mkdir()
+        from sync import file_sha256
+        ledger = {file_sha256(self.inbox / "a.jpg"): {
+            "file": "a.jpg", "status": "created", "url": f"https://app.notion.com/p/{page}"}}
+        (self.data / "synced.json").write_text(json.dumps(ledger), encoding="utf-8")
+        reader = FakeReader({"a.jpg": card()})
+        attached = []
+
+        def register(_value, _attachment):
+            raise AssertionError("existing rows must not be created again")
+
+        def attach(page_id, attachment):
+            attached.append((page_id, attachment[1], attachment[2]))
+
+        counts = self.run_sync(reader, register, attach=attach)
+        self.assertEqual(counts["attached"], 1)
+        self.assertEqual(attached, [(page, "a.jpg", "山田 花子\n全文")])
+        counts = self.run_sync(reader, register, attach=attach)
+        self.assertEqual((counts["skipped"], len(attached)), (1, 1))
 
 
 class CheckNotionTest(unittest.TestCase):
@@ -144,10 +171,51 @@ class CheckNotionTest(unittest.TestCase):
         self.assertEqual(methods, ["GET", "GET"])
 
 
+class AttachmentTest(unittest.TestCase):
+    def test_save_card_uploads_photo_and_writes_full_text(self):
+        import httpx
+        from functools import partial
+        from unittest.mock import patch
+
+        from app import save_card
+
+        schema = {label: {"type": kind} for label, kind in FIELDS.values()}
+        calls = []
+
+        def notion(request):
+            calls.append((request.method, request.url.path))
+            if request.method == "GET":
+                return httpx.Response(200, json={"properties": schema})
+            if request.url.path == "/v1/file_uploads":
+                body = json.loads(request.content)
+                self.assertEqual(body["content_type"], "image/jpeg")
+                return httpx.Response(200, json={"id": "upload-1", "status": "pending"})
+            if request.url.path == "/v1/file_uploads/upload-1/send":
+                self.assertIn(b"JPEGDATA", request.content)
+                self.assertTrue(request.headers["content-type"].startswith("multipart/form-data"))
+                return httpx.Response(200, json={"id": "upload-1", "status": "uploaded"})
+            body = json.loads(request.content)
+            image, text = body["children"][1], body["children"][3]
+            self.assertEqual(image["image"]["file_upload"]["id"], "upload-1")
+            self.assertEqual("".join(part["text"]["content"] for part in text["paragraph"]["rich_text"]),
+                             "山田 花子\n" + "あ" * 2500)
+            self.assertEqual(len(text["paragraph"]["rich_text"]), 2)
+            return httpx.Response(200, json={"id": "page-1", "url": "https://notion.so/page-1"})
+
+        factory = partial(httpx.Client, transport=httpx.MockTransport(notion))
+        environment = {"NOTION_TOKEN": "test", "NOTION_DATA_SOURCE_ID": "0b4595fd-a02d-4b71-95c5-0c482316cc45"}
+        with patch("app.httpx.Client", side_effect=factory), patch.dict("os.environ", environment):
+            result = save_card(card(), (b"JPEGDATA", "a.jpg", "山田 花子\n" + "あ" * 2500))
+        self.assertEqual(result, ("created", "https://notion.so/page-1", "page-1"))
+        self.assertEqual([path for _, path in calls], [
+            "/v1/data_sources/0b4595fd-a02d-4b71-95c5-0c482316cc45",
+            "/v1/file_uploads", "/v1/file_uploads/upload-1/send", "/v1/pages"])
+
+
 class ParseTest(unittest.TestCase):
     def test_parse_model_answer(self):
-        text = '```json\n{"name": " 山田 花子 ", "email": null, "extra": "x"}\n```'
-        self.assertEqual(parse_response(text), card())
+        text = '```json\n{"full_text": "山田 花子\n架空商事", "name": " 山田 花子 ", "email": null}\n```'
+        self.assertEqual(parse_response(text), (card(), "山田 花子\n架空商事"))
         with self.assertRaises(CardError):
             parse_response("読めませんでした")
 

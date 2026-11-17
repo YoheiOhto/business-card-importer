@@ -289,11 +289,54 @@ def check_notion():
     return columns
 
 
-def save_card(card):
+def upload_image(client, jpeg, filename):
+    """Upload JPEG bytes with Notion's file upload API and return the upload ID."""
+    upload = notion_request(
+        client, "POST", "/file_uploads",
+        json={"mode": "single_part", "filename": filename, "content_type": "image/jpeg"},
+    )
+    if not isinstance(upload.get("id"), str):
+        raise CardError("Notion への画像のアップロードを開始できませんでした。", 502)
+    sent = notion_request(
+        client, "POST", f"/file_uploads/{upload['id']}/send",
+        files={"file": (filename, jpeg, "image/jpeg")},
+    )
+    if sent.get("status") != "uploaded":
+        raise CardError("Notion への画像のアップロードが完了しませんでした。", 502)
+    return upload["id"]
+
+
+def page_blocks(upload_id, full_text):
+    """Build the page body: the card photo, then everything the model read."""
+    blocks = [
+        {"type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": "名刺の画像"}}]}},
+        {"type": "image", "image": {"type": "file_upload", "file_upload": {"id": upload_id}}},
+        {"type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": "読み取った全文"}}]}},
+    ]
+    text = full_text.strip() or "（全文を読み取れませんでした）"
+    # Notion caps one text object at 2000 characters.
+    chunks = [text[start:start + 2000] for start in range(0, len(text), 2000)][:100]
+    blocks.append({"type": "paragraph", "paragraph": {
+        "rich_text": [{"type": "text", "text": {"content": chunk}} for chunk in chunks]}})
+    return blocks
+
+
+def append_attachment(page_id, attachment):
+    """Add the photo and full text to an existing page."""
+    jpeg, filename, full_text = attachment
+    with SAVE_LOCK, notion_client() as client:
+        upload_id = upload_image(client, jpeg, filename)
+        notion_request(client, "PATCH", f"/blocks/{page_id}/children",
+                       json={"children": page_blocks(upload_id, full_text)})
+
+
+def save_card(card, attachment=None):
     """Create a Notion row for a validated card.
 
-    Returns ``("created", url)``, or ``("duplicate", url)`` when a row with
-    the same email already exists.
+    ``attachment`` is ``(jpeg_bytes, filename, full_text)``; when given, the
+    page body holds the card photo and the full text read from it.
+    Returns ``("created", url, page_id)``, or ``("duplicate", url, page_id)``
+    when a row with the same email already exists.
     """
     data_source_id, columns = read_notion_config()
     source_path = f"/data_sources/{data_source_id}"
@@ -315,20 +358,21 @@ def save_card(card):
             if not isinstance(matches, list):
                 raise CardError("Notion の重複確認の結果を取得できませんでした。", 502)
             if matches:
-                return "duplicate", matches[0].get("url")
+                return "duplicate", matches[0].get("url"), matches[0].get("id")
 
-        page = notion_request(
-            client, "POST", "/pages",
-            json={"parent": {"type": "data_source_id", "data_source_id": data_source_id},
-                  "properties": properties},
-        )
-    return "created", page.get("url")
+        body = {"parent": {"type": "data_source_id", "data_source_id": data_source_id},
+                "properties": properties}
+        if attachment:
+            jpeg, filename, full_text = attachment
+            body["children"] = page_blocks(upload_image(client, jpeg, filename), full_text)
+        page = notion_request(client, "POST", "/pages", json=body)
+    return "created", page.get("url"), page.get("id")
 
 
 @app.post("/api/register")
 def register():
     request.max_content_length = 64 * 1024
-    status, url = save_card(validated_card(request.get_json(silent=True)))
+    status, url, _ = save_card(validated_card(request.get_json(silent=True)))
     if status == "duplicate":
         return jsonify(error="このメールアドレスは登録済みです。", url=url), 409
     return jsonify(url=url), 201
