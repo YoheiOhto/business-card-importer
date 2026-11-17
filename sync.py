@@ -17,7 +17,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app import FIELDS, CardError, prepare_jpeg, save_card, validated_card
+from app import FIELDS, CardError, check_notion, prepare_jpeg, save_card, validated_card
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INBOX = ROOT / "inbox"
@@ -177,11 +177,14 @@ def save_ledger(path, ledger):
     temporary.replace(path)
 
 
-def sync(inbox, data_dir, reader, dry_run=False, retry=False, register=save_card, out=print):
-    """Process new images and return counts per outcome."""
+def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None, register=save_card, out=print):
+    """Process new images and return counts per outcome.
+
+    ``limit`` caps how many new images are read; the rest wait for the next run.
+    """
     ledger_path = data_dir / "synced.json"
     ledger = load_ledger(ledger_path)
-    counts = dict.fromkeys(("created", "duplicate", "uncertain", "failed", "skipped", "read"), 0)
+    counts = dict.fromkeys(("created", "duplicate", "uncertain", "failed", "skipped", "read", "left"), 0)
     images = find_images(inbox)
     seen = set()
     for path in images:
@@ -189,6 +192,9 @@ def sync(inbox, data_dir, reader, dry_run=False, retry=False, register=save_card
         entry = ledger.get(digest, {})
         if digest in seen or (entry.get("status") in DONE_STATES and not retry):
             counts["skipped"] += 1
+            continue
+        if limit is not None and len(seen) >= limit:
+            counts["left"] += 1
             continue
         seen.add(digest)
         name = path.relative_to(inbox)
@@ -246,7 +252,14 @@ def main(argv=None):
     parser.add_argument("--model", default=DEFAULT_MODEL, help="mlx-vlm のモデル名")
     parser.add_argument("--dry-run", action="store_true", help="読み取り結果を表示するだけで Notion に送らない")
     parser.add_argument("--retry", action="store_true", help="登録済みの画像も含めてもう一度処理する")
+    parser.add_argument("--limit", type=int, help="新しい画像のうち、先頭から指定した枚数だけ処理する")
+    parser.add_argument("--check", action="store_true",
+                        help="画像・モデル・Notion の準備を確かめるだけで、読み取りも登録もしない")
     args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit は1以上にしてください。")
+    if args.check:
+        return check(args)
 
     if not args.inbox.is_dir():
         args.inbox.mkdir(parents=True)
@@ -254,7 +267,8 @@ def main(argv=None):
         return 0
     reader = QwenReader(args.model, args.data / "vlm_cache")
     try:
-        counts = sync(args.inbox, args.data, reader, dry_run=args.dry_run, retry=args.retry)
+        counts = sync(args.inbox, args.data, reader, dry_run=args.dry_run, retry=args.retry,
+                      limit=args.limit)
     except CardError as error:
         print(f"✗ {error}", file=sys.stderr)
         return 1
@@ -267,7 +281,49 @@ def main(argv=None):
               f"処理済みで省略 {counts['skipped']} 件")
         if counts["uncertain"]:
             print("結果不明の画像は、Notion で登録されたか確かめてから --retry で再実行してください。")
+    if counts["left"]:
+        print(f"--limit のため {counts['left']} 件を残しました。次の実行で処理します。")
     return 1 if counts["failed"] or counts["uncertain"] else 0
+
+
+def check(args):
+    """Report whether images, the model and Notion are ready, without side effects."""
+    ready = True
+    if args.inbox.is_dir():
+        images = find_images(args.inbox)
+        ledger = load_ledger(args.data / "synced.json")
+        new = {file_sha256(path) for path in images} - {
+            digest for digest, entry in ledger.items() if entry.get("status") in DONE_STATES}
+        if images:
+            print(f"✓ 画像: {args.inbox} に {len(images)} 枚（未登録 {len(new)} 枚）")
+        else:
+            ready = False
+            print(f"✗ 画像: {args.inbox} に JPEG・PNG・HEIC の名刺画像を置いてください。")
+    else:
+        ready = False
+        print(f"✗ 画像: {args.inbox} がありません。作ってから名刺画像を置いてください。")
+
+    import importlib.util
+    if importlib.util.find_spec("mlx_vlm") is None:
+        ready = False
+        print("✗ モデル: mlx-vlm がありません。Apple Silicon の Mac で uv sync --locked を実行してください。")
+    else:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            cached = isinstance(try_to_load_from_cache(args.model, "config.json"), str)
+        except ImportError:
+            cached = False
+        print(f"✓ モデル: {args.model}" + ("" if cached else "（未ダウンロード。初回の読み取りで取得します）"))
+
+    try:
+        columns = check_notion()
+    except CardError as error:
+        ready = False
+        print(f"✗ Notion: {error}")
+    else:
+        print(f"✓ Notion: 登録先と {len(columns)} 列を確認しました（書き込みはしていません）")
+    print("\n準備ができています。" if ready else "\n✗ の項目を直してから、もう一度 --check を実行してください。")
+    return 0 if ready else 1
 
 
 if __name__ == "__main__":

@@ -257,6 +257,38 @@ def property_value(kind, value):
     return {kind: value}
 
 
+def column_kind(schema, field, column):
+    """Return the Notion type of a column, or raise if it cannot hold the field."""
+    label, preferred_kind = FIELDS[field]
+    kind = schema.get(column, {}).get("type")
+    compatible = {preferred_kind}
+    if field not in {"name", "email"}:
+        compatible.add("rich_text")
+    if kind not in compatible:
+        raise CardError(f"Notion の「{column}」列を確認してください（{label}）。", 422)
+    return kind
+
+
+def notion_client():
+    headers = {
+        "Authorization": f"Bearer {notion_token()}",
+        "Notion-Version": "2026-03-11",
+    }
+    return httpx.Client(
+        base_url="https://api.notion.com/v1/", headers=headers, timeout=15, trust_env=False
+    )
+
+
+def check_notion():
+    """Check the settings, token and every column without writing to Notion."""
+    data_source_id, columns = read_notion_config()
+    with notion_client() as client:
+        schema = notion_request(client, "GET", f"/data_sources/{data_source_id}").get("properties", {})
+    for field, column in columns.items():
+        column_kind(schema, field, column)
+    return columns
+
+
 def save_card(card):
     """Create a Notion row for a validated card.
 
@@ -264,28 +296,15 @@ def save_card(card):
     the same email already exists.
     """
     data_source_id, columns = read_notion_config()
-    headers = {
-        "Authorization": f"Bearer {notion_token()}",
-        "Notion-Version": "2026-03-11",
-    }
     source_path = f"/data_sources/{data_source_id}"
-    with SAVE_LOCK, httpx.Client(
-        base_url="https://api.notion.com/v1/", headers=headers, timeout=15, trust_env=False
-    ) as client:
+    with SAVE_LOCK, notion_client() as client:
         schema = notion_request(client, "GET", source_path).get("properties", {})
         properties = {}
         for field, value in card.items():
             if not value:
                 continue
-            label, preferred_kind = FIELDS[field]
-            column = columns[field]
-            kind = schema.get(column, {}).get("type")
-            compatible = {preferred_kind}
-            if field not in {"name", "email"}:
-                compatible.add("rich_text")
-            if kind not in compatible:
-                raise CardError(f"Notion の「{column}」列を確認してください（{label}）。", 422)
-            properties[column] = property_value(kind, value)
+            kind = column_kind(schema, field, columns[field])
+            properties[columns[field]] = property_value(kind, value)
 
         if card["email"]:
             matches = notion_request(

@@ -106,6 +106,43 @@ class SyncTest(unittest.TestCase):
         counts = self.run_sync(reader, lost)
         self.assertEqual(counts["skipped"], 2)
 
+    def test_limit_reads_only_the_first_new_images(self):
+        for index, color in enumerate(("white", "gray", "black")):
+            self.image(f"{index}.jpg", color)
+        reader = FakeReader({f"{index}.jpg": card(name=f"名前{index}") for index in range(3)})
+        register = lambda value: ("created", "https://notion.so/new")
+
+        counts = self.run_sync(reader, register, limit=2)
+        self.assertEqual((counts["created"], counts["left"]), (2, 1))
+        counts = self.run_sync(reader, register, limit=2)
+        self.assertEqual((counts["created"], counts["skipped"], counts["left"]), (1, 2, 0))
+        self.assertEqual(reader.calls, ["0.jpg", "1.jpg", "2.jpg"])
+
+
+class CheckNotionTest(unittest.TestCase):
+    def test_check_reads_schema_and_reports_wrong_column(self):
+        import httpx
+        from functools import partial
+        from unittest.mock import patch
+
+        from app import check_notion
+
+        schema = {label: {"type": kind} for label, kind in FIELDS.values()}
+        methods = []
+
+        def notion(request):
+            methods.append(request.method)
+            return httpx.Response(200, json={"properties": schema})
+
+        factory = partial(httpx.Client, transport=httpx.MockTransport(notion))
+        environment = {"NOTION_TOKEN": "test", "NOTION_DATA_SOURCE_ID": "0b4595fd-a02d-4b71-95c5-0c482316cc45"}
+        with patch("app.httpx.Client", side_effect=factory), patch.dict("os.environ", environment):
+            self.assertEqual(len(check_notion()), len(FIELDS))
+            schema["メール"] = {"type": "rich_text"}
+            with self.assertRaisesRegex(CardError, "メール"):
+                check_notion()
+        self.assertEqual(methods, ["GET", "GET"])
+
 
 class ParseTest(unittest.TestCase):
     def test_parse_model_answer(self):
