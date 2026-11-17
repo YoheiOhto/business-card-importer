@@ -269,6 +269,12 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(CardError):
             clean_card(card(name=""))
 
+    def test_name_spacing_is_unified(self):
+        for name in ("山田　花子", "山田  花子", "山田\t花子", " 山田 　花子 "):
+            self.assertEqual(clean_card(card(name=name))[0]["name"], "山田 花子")
+        self.assertEqual(clean_card(card(name="Hanako  Yamada"))[0]["name"], "Hanako Yamada")
+        self.assertEqual(clean_card(card(name="山田花子"))[0]["name"], "山田花子")
+
 
 if __name__ == "__main__":
     unittest.main()
