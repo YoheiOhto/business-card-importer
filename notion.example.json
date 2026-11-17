@@ -1,0 +1,13 @@
+{
+  "data_source_id": "00000000-0000-0000-0000-000000000000",
+  "properties": {
+    "name": "氏名",
+    "company": "会社名",
+    "department": "部署",
+    "position": "役職",
+    "email": "メール",
+    "phone": "電話",
+    "address": "住所",
+    "website": "Webサイト"
+  }
+}

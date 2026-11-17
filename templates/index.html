@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>名刺取り込み</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body>
+  <main>
+    <header class="page-heading">
+      <h1>名刺取り込み</h1>
+      <p>名刺を読み取って、内容を確認してから Notion に登録します。</p>
+    </header>
+
+    <div class="workspace">
+      <section class="panel" aria-labelledby="image-heading">
+        <div class="panel-heading">
+          <h2 id="image-heading">名刺画像</h2>
+          <span class="model">{{ model }}</span>
+        </div>
+        <label class="upload" id="upload">
+          <input id="file" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" aria-label="名刺画像を選ぶ">
+          <span class="upload-placeholder" id="placeholder">
+            <span class="upload-mark" aria-hidden="true">＋</span>
+            <strong>画像を選ぶ</strong>
+            <small>ドラッグ＆ドロップにも対応</small>
+          </span>
+          <img id="preview" alt="選択した名刺画像" hidden>
+        </label>
+        <div class="image-actions">
+          <small id="filename">JPEG・PNG / 20 MB まで</small>
+          <button type="button" id="extract" class="secondary" disabled>読み取る</button>
+        </div>
+        <p class="status" id="extract-status" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="details-heading">
+        <div class="panel-heading">
+          <h2 id="details-heading">確認・修正</h2>
+          <small>＊必須</small>
+        </div>
+        <p class="hint">名刺と見比べて、読み取り結果を修正できます。</p>
+        <form id="card-form">
+          <div class="fields">
+            {% for key, (label, kind) in fields.items() %}
+            <label{% if key in ('address', 'website') %} class="wide"{% endif %}>
+              <span>{{ label }}{% if key == 'name' %} <span class="required">＊</span>{% endif %}</span>
+              <input name="{{ key }}" maxlength="{{ limits.get(key, 2000) }}"
+                     {% if key == 'name' %}required{% endif %}
+                     {% if key == 'email' %}type="email" inputmode="email"{% endif %}
+                     {% if key == 'phone' %}type="tel" inputmode="tel"{% endif %}
+                     {% if key == 'website' %}inputmode="url"{% endif %}
+                     autocomplete="off" spellcheck="false">
+            </label>
+            {% endfor %}
+          </div>
+          <div class="register-actions">
+            <button type="submit" id="register">Notion に登録</button>
+            <button type="button" id="next" class="secondary" hidden>次の名刺</button>
+          </div>
+          <p class="status" id="register-status" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </div>
+    <footer>画像はこのMacで処理し、フォームの内容を Notion に送信します。</footer>
+  </main>
+</body>
+</html>
