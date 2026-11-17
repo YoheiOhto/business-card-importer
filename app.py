@@ -85,7 +85,8 @@ def index():
     return render_template("index.html", fields=FIELDS, limits=FIELD_LIMITS, model=MODEL)
 
 
-def prepare_image(data):
+def prepare_jpeg(data):
+    """Return the card as upright JPEG bytes, at most 2400 px on the long side."""
     try:
         with Image.open(io.BytesIO(data), formats=("JPEG", "PNG")) as source:
             if source.width * source.height > 40_000_000:
@@ -100,7 +101,11 @@ def prepare_image(data):
             background.save(buffer, format="JPEG", quality=95)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError, SyntaxError, ValueError):
         raise CardError("JPEG または PNG として画像を開けませんでした。") from None
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+    return buffer.getvalue()
+
+
+def prepare_image(data):
+    return base64.b64encode(prepare_jpeg(data)).decode("ascii")
 
 
 @app.post("/api/extract")
@@ -252,10 +257,12 @@ def property_value(kind, value):
     return {kind: value}
 
 
-@app.post("/api/register")
-def register():
-    request.max_content_length = 64 * 1024
-    card = validated_card(request.get_json(silent=True))
+def save_card(card):
+    """Create a Notion row for a validated card.
+
+    Returns ``("created", url)``, or ``("duplicate", url)`` when a row with
+    the same email already exists.
+    """
     data_source_id, columns = read_notion_config()
     headers = {
         "Authorization": f"Bearer {notion_token()}",
@@ -289,17 +296,23 @@ def register():
             if not isinstance(matches, list):
                 raise CardError("Notion の重複確認の結果を取得できませんでした。", 502)
             if matches:
-                return jsonify(
-                    error="このメールアドレスは登録済みです。",
-                    url=matches[0].get("url"),
-                ), 409
+                return "duplicate", matches[0].get("url")
 
         page = notion_request(
             client, "POST", "/pages",
             json={"parent": {"type": "data_source_id", "data_source_id": data_source_id},
                   "properties": properties},
         )
-    return jsonify(url=page.get("url")), 201
+    return "created", page.get("url")
+
+
+@app.post("/api/register")
+def register():
+    request.max_content_length = 64 * 1024
+    status, url = save_card(validated_card(request.get_json(silent=True)))
+    if status == "duplicate":
+        return jsonify(error="このメールアドレスは登録済みです。", url=url), 409
+    return jsonify(url=url), 201
 
 
 if __name__ == "__main__":

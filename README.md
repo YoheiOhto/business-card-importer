@@ -1,19 +1,53 @@
 # 名刺取り込み
 
-Macで名刺画像を Qwen 3.5 4B に読み取らせ、画面で修正した項目を Notion データベースに登録します。読み取りは Ollama のローカルAPIを使います。画像はメモリ内で処理し、Notion にはフォームの項目だけを送信します。
+名刺の写真をMacのフォルダに置き、1つのコマンドで読み取って Notion データベースに登録します。読み取りはこのMacの中で動く Qwen3.5（`mlx-vlm`）が行い、画像はMacの外に出ません。Notion には読み取った項目だけを送ります。
 
-## 起動する
+1枚ずつ画面で確かめて直したい場合は、ブラウザで使う画面（後述）もあります。
 
-[Ollama for Mac](https://ollama.com/download/mac) をインストールして起動し、ターミナルでモデルを取得します。クラウド機能をオフにする場合は、モデル取得後に Ollama の設定で無効にできます。
+## 準備
 
-```sh
-ollama pull qwen3.5:4b
-```
-
-このフォルダで以下を実行します。Python 3.11 以降と [uv](https://docs.astral.sh/uv/getting-started/installation/) が必要です。
+Apple Silicon の Mac、Python 3.11 以降、[uv](https://docs.astral.sh/uv/getting-started/installation/) が必要です。このフォルダで次を実行します。
 
 ```sh
 uv sync --locked
+```
+
+Notion の登録先は、下の「Notion の登録先を設定する」で設定します。
+
+## いつもの使い方（`sync.py`）
+
+1. 名刺の画像（JPEG・PNG・HEIC）を `inbox/` に置きます。サブフォルダに分けても構いません。1枚の画像に名刺1枚、文字が正立する向きで撮ります。
+2. 次を実行します。
+
+   ```sh
+   uv run --locked python sync.py
+   ```
+
+3. 表示された Notion のURLで、登録内容を確かめます。誤読は Notion 上で直します。
+
+`sync.py` の動き:
+
+- `inbox/` の画像のうち、まだ登録していない画像だけを読みます。画像は中身の SHA-256 で見分けるので、ファイル名を変えたりコピーしたりしても二重に登録しません。記録は `data/synced.json` にあります。
+- 同じメールアドレスの行が Notion にあれば、新しい行を作らず既存の行のURLを表示します。
+- 氏名が読めなかった画像は登録せず、次の実行で読み直します。メールやURLの形式が崩れている場合は、その項目だけを空欄にして登録し、そのことを表示します。
+- Notion への送信中に通信が切れた画像は「結果不明」として、次の実行では送りません。Notion で確かめてから `--retry` で再実行します。
+- 初回はモデル（`mlx-community/Qwen3.5-4B-8bit`、約5 GB）をダウンロードします。読み取り結果は `data/vlm_cache/` に保存するので、同じ画像を2回読むことはありません。
+
+| オプション | 意味 |
+| --- | --- |
+| `--dry-run` | 読み取り結果を表示するだけで、Notion には送りません。最初の確認に使います。 |
+| `--retry` | 登録済みの画像も、もう一度処理します。 |
+| `--model` | 別のモデルを使います。小さい文字の誤読が多いときは `mlx-community/Qwen3.5-9B-8bit` を試します。 |
+| `--inbox`・`--data` | 画像のフォルダと、記録・キャッシュの保存先を変えます。 |
+
+`inbox/`・`data/`・`notion.local.json` は Git の管理外です。名刺の画像や個人情報はリポジトリに入りません。
+
+## ブラウザで1枚ずつ確かめる画面
+
+読み取り結果を画面で直してから登録したい場合に使います。この画面は [Ollama for Mac](https://ollama.com/download/mac) で読み取ります。Ollama を起動し、モデルを取得してからアプリを起動します。
+
+```sh
+ollama pull qwen3.5:4b
 uv run --locked python app.py
 ```
 
@@ -28,10 +62,10 @@ uv run --locked python app.py
 ## Notion の登録先を設定する
 
 1. 既存の名刺データベースを使うか、動作確認用のデータベースを用意します。下表の列を使います。
-2. Notion の [開発者ポータル](https://www.notion.so/profile/integrations) で内部インテグレーションを作り、**コンテンツの読み取り**と**コンテンツの挿入**を有効にします。対象の元データベースを開き、右上の **… → 接続** からそのインテグレーションを追加します。[Notion の接続ガイド](https://developers.notion.com/guides/connections-and-tokens/overview)
+2. Notion の開発者ポータルで、登録先と同じワークスペースを選んで内部接続を作ります。**Configuration** で **コンテンツの読み取り**と**コンテンツの挿入**を有効にし、**Content access → Edit access** で対象の元データベースを追加します。データベース側の **… → 接続 → 接続を追加** からも設定できます。[開発者ポータル](https://app.notion.com/developers/connections) · [Notion の内部接続ガイド](https://developers.notion.com/guides/connections-and-tokens/internal-connections)
 3. データベースの設定から **データソースを管理 → データソース ID をコピー** を選びます。[ID の確認方法](https://developers.notion.com/reference/retrieve-a-data-source#finding-a-data-source-id)
 4. `cp notion.example.json notion.local.json` を実行し、`data_source_id` を取得した値に置き換えます。既存の列名を使う場合は `properties` の右側だけを変更します。
-5. Macの「キーチェーンアクセス」を開き、ログインキーチェーンに新しいパスワード項目を作ります。項目名を `business-card-importer-notion`、アカウント名を任意の値（例 `notion`）、パスワードをインテグレーションのトークンにします。アプリは登録時にこの項目を読みます。キーチェーンを使わない運用では、起動するプロセスに環境変数 `NOTION_TOKEN` を渡せます。
+5. Macの「キーチェーンアクセス」で **ログイン** を選び、**⌘N** でパスワード項目を作ります。項目名は `business-card-importer-notion`、アカウント名は任意（例 `notion`）、パスワード欄には **Configuration** にある内部接続トークンを入れます。アプリは登録時にこの項目を読みます。
 
 | 既定の列名 | Notion の列の型 |
 | --- | --- |
@@ -43,10 +77,59 @@ uv run --locked python app.py
 
 ポートが競合する場合は、アプリの起動時に `CARD_APP_PORT` を指定します。Ollama を別ポートで起動した場合は `CARD_OLLAMA_PORT` も指定します。どちらも接続先はこのMac内です。
 
+### 接続で詰まったら
+
+- **「キーチェーンに設定してください」**と出る場合は、アプリを起動したのと同じユーザーで、下のコマンドを実行します。トークンを表示せず、項目名で検索できます。見つからなければ「ログイン」が選択されているかと項目名を確認します。見つかっても登録できない場合は、登録ボタンを押したときにmacOSのアクセス許可ダイアログが出ていないか確認します。
+
+  ```sh
+  if security find-generic-password -s business-card-importer-notion >/dev/null 2>&1; then
+    echo "キーチェーンに項目あり"
+  else
+    echo "キーチェーンに項目なし"
+  fi
+  ```
+
+- **「トークン、接続権限、データソース ID を確認してください」**と出る場合は、内部接続とDBが同じワークスペースにあり、対象DBが **Content access** に表示されるか確認します。`notion.local.json` にはデータベースのURLに含まれるIDやビューIDではなく、**データソース ID** を入れます。
+- **「列を確認してください」**と出る場合は、設定ファイルの列名とDB側の列名・型を照合します。既定の列名と型は上の表を参照してください。
+
+キーチェーンの確認と並行して通常画面を試す場合は、リポジトリのフォルダを開いたターミナルで次を実行します。トークンが画面に表示されない入力欄が開き、入力値は起動したアプリのプロセスに `NOTION_TOKEN` として渡ります。ターミナルで **Ctrl+C** を押すとアプリが終了します。
+
+```sh
+CARD_APP_PORT=8767 uv run --locked python -c '
+import getpass
+import os
+import sys
+import warnings
+
+warnings.simplefilter("error", getpass.GetPassWarning)
+token = getpass.getpass("Notion の内部接続トークン: ").strip()
+if not token:
+    sys.exit("トークンが空です。")
+os.environ["NOTION_TOKEN"] = token
+os.execv(sys.executable, [sys.executable, "app.py"])
+'
+```
+
+起動したら [代替ポートの名刺取り込み画面](http://127.0.0.1:8767/) を開きます。接続トークンはキーチェーンか非表示の入力欄で扱い、`notion.local.json` には登録先と列名だけを保存します。
+
 ## 検証
 
 ```sh
 uv run --locked python -m unittest discover -s tests -v
 ```
 
-テストでは Ollama と Notion の応答を模擬します。実際の Notion 接続は、上の設定を済ませてから、架空の名刺を入力してテスト用データベースの1行を確認してください。通信エラーで登録結果が不明と表示された場合は、Notionで登録状況を確認してから再試行してください。
+テストでは Ollama・ローカルモデル・Notion の応答を模擬します。実際の Notion 接続は、上の設定を済ませてから、架空の名刺を入力してテスト用データベースの1行を確認してください。通信エラーで登録結果が不明と表示された場合は、Notionで登録状況を確認してから再試行してください。
+
+### 2026-11-17 の動作確認
+
+- `sync.py --dry-run` で、架空の日本語名刺「鈴木 太郎」の画像から8項目すべてを正しく取得しました（TELとFAXが並ぶ名刺でTELを選択）。モデル読み込みを含めて約45秒でした。HEIC も読めましたが、90度回転した画像では「サンプル」を「サングル」と誤読しました。`sync.py` から Notion への実登録は未確認です。
+- このMacの Ollama で、架空の日本語名刺「山田 花子」から8項目を取得しました。モデル読み込みを含む初回は約18秒でした。
+- 一時的なローカル接続画面で入力したトークンを使い、アプリの登録処理から「名刺取り込み テスト用」DBに1件作成しました。Notion 側で、会社名が修正後の「株式会社サンプル商事（動作確認）」になっており、ほかの7項目も一致することを確認しました。
+- 通常画面ではログインキーチェーンの項目を取得できませんでした。代替のターミナル起動による実登録も未確認です。
+
+### 残りの TODO
+
+- [ ] 架空の名刺画像を `inbox/` に置いて `sync.py` を実行し、テスト用DBに1行できることと、再実行で省略されることを確認する。
+- [ ] アプリを普段使う方法で起動し、ログインキーチェーンの項目が見つからなかった原因を確認する。項目の取得後、通常画面の **Notion に登録** から別の架空の名刺を1件作り、修正値が保存されるところまで確認する。
+- [ ] 通常画面の「Notion で開く」と、同じメールアドレスで再登録したときの重複表示を実DBで確認する。今回の Notion 側で確認したページURLは `app.notion.com` だったため、通常画面でもこのホストのリンクを扱えるようにする。
+- [ ] 日本語名刺を数枚読み取り、氏名・メール・電話の誤読と所要時間を確認する。小さな文字の誤読が続く場合は macOS の Vision OCR 併用を試す。

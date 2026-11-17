@@ -1,9 +1,15 @@
 [project]
 name = "business-card-importer"
 version = "0.1.0"
-description = "Review locally extracted business card details and save them to Notion."
+description = "Read business card images locally on a Mac and save the details to Notion."
 requires-python = ">=3.11"
-dependencies = ["flask>=3.1,<4", "httpx>=0.28,<1", "pillow>=12,<13"]
+dependencies = [
+    "flask>=3.1,<4",
+    "httpx>=0.28,<1",
+    "pillow>=12,<13",
+    # Local VLM for sync.py; mlx runs only on Apple Silicon Macs.
+    "mlx-vlm>=0.8,<0.9; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [tool.uv]
 package = false
