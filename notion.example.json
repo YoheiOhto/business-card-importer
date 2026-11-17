@@ -8,6 +8,8 @@
     "email": "メール",
     "phone": "電話",
     "address": "住所",
-    "website": "Webサイト"
+    "website": "Webサイト",
+    "event": "学会",
+    "met_on": "日付"
   }
 }

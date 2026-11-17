@@ -32,6 +32,12 @@ FIELDS = {
     "website": ("Webサイト", "url"),
 }
 FIELD_LIMITS = {"email": 254, "phone": 200, "website": 2000}
+# Where and when a card was received. These are not on the card, so the user
+# gives them per sync run; each maps to a column and its accepted types.
+CONTEXT_FIELDS = {
+    "event": ("学会", ("select", "rich_text")),
+    "met_on": ("日付", ("date",)),
+}
 CARD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -166,11 +172,13 @@ def read_notion_config():
             raise ValueError("Missing data source ID")
         overrides = config.get("properties", {})
         if not isinstance(overrides, dict) or any(
-            field not in FIELDS or not isinstance(name, str) or not name.strip()
+            (field not in FIELDS and field not in CONTEXT_FIELDS)
+            or not isinstance(name, str) or not name.strip()
             for field, name in overrides.items()
         ):
             raise ValueError("Invalid property mapping")
-        columns = {field: overrides.get(field, label) for field, (label, _) in FIELDS.items()}
+        columns = {field: overrides.get(field, label)
+                   for field, (label, _) in (FIELDS | CONTEXT_FIELDS).items()}
         if len(set(columns.values())) != len(columns):
             raise ValueError("Duplicate property mapping")
     except (AttributeError, KeyError, OSError, TypeError, ValueError):
@@ -284,9 +292,37 @@ def check_notion():
     data_source_id, columns = read_notion_config()
     with notion_client() as client:
         schema = notion_request(client, "GET", f"/data_sources/{data_source_id}").get("properties", {})
-    for field, column in columns.items():
-        column_kind(schema, field, column)
-    return columns
+    for field in FIELDS:
+        column_kind(schema, field, columns[field])
+    return columns, {field: columns[field] in schema for field in CONTEXT_FIELDS}
+
+
+def context_properties(schema, columns, context):
+    """Build Notion values for the event and date given by the user."""
+    properties = {}
+    for field, value in (context or {}).items():
+        if not value:
+            continue
+        column, kinds = columns[field], CONTEXT_FIELDS[field][1]
+        kind = schema.get(column, {}).get("type")
+        if kind not in kinds:
+            raise CardError(f"Notion に「{column}」列（種類: {' または '.join(kinds)}）を作ってください。", 422)
+        if kind == "select":
+            properties[column] = {"select": {"name": value}}
+        elif kind == "date":
+            properties[column] = {"date": {"start": value}}
+        else:
+            properties[column] = property_value(kind, value)
+    return properties
+
+
+def update_context(page_id, context):
+    """Set the event and date on an existing page."""
+    data_source_id, columns = read_notion_config()
+    with SAVE_LOCK, notion_client() as client:
+        schema = notion_request(client, "GET", f"/data_sources/{data_source_id}").get("properties", {})
+        notion_request(client, "PATCH", f"/pages/{page_id}",
+                       json={"properties": context_properties(schema, columns, context)})
 
 
 def upload_image(client, jpeg, filename):
@@ -330,11 +366,12 @@ def append_attachment(page_id, attachment):
                        json={"children": page_blocks(upload_id, full_text)})
 
 
-def save_card(card, attachment=None):
+def save_card(card, attachment=None, context=None):
     """Create a Notion row for a validated card.
 
     ``attachment`` is ``(jpeg_bytes, filename, full_text)``; when given, the
     page body holds the card photo and the full text read from it.
+    ``context`` is ``{"event": ..., "met_on": "YYYY-MM-DD"}`` for the extra columns.
     Returns ``("created", url, page_id)``, or ``("duplicate", url, page_id)``
     when a row with the same email already exists.
     """
@@ -348,6 +385,7 @@ def save_card(card, attachment=None):
                 continue
             kind = column_kind(schema, field, columns[field])
             properties[columns[field]] = property_value(kind, value)
+        properties |= context_properties(schema, columns, context)
 
         if card["email"]:
             matches = notion_request(

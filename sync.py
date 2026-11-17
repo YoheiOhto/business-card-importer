@@ -14,11 +14,11 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from app import (FIELDS, CardError, append_attachment, check_notion, prepare_jpeg, save_card,
-                 validated_card)
+                 update_context, validated_card)
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INBOX = ROOT / "inbox"
@@ -188,43 +188,70 @@ def page_id_of(entry):
     return match.group(1) if match else None
 
 
-def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None,
-         register=save_card, attach=append_attachment, out=print):
+def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None, context=None,
+         register=save_card, attach=append_attachment, tag=update_context, out=print):
     """Process new images and return counts per outcome.
 
     Rows created before the page body existed get the photo and full text
-    added once. ``limit`` caps how many images are read; the rest wait for the
-    next run.
+    added once. ``context`` holds the event and date for this batch; rows
+    already created from these images get them too, so a batch can be
+    labelled after the fact. ``limit`` caps how many images are read; the
+    rest wait for the next run.
     """
+    context = {key: value for key, value in (context or {}).items() if value}
     ledger_path = data_dir / "synced.json"
     ledger = load_ledger(ledger_path)
-    counts = dict.fromkeys(
-        ("created", "duplicate", "uncertain", "failed", "skipped", "read", "left", "attached"), 0)
-    images = find_images(inbox)
+    counts = dict.fromkeys(("created", "duplicate", "uncertain", "failed", "skipped", "read",
+                            "left", "attached", "tagged"), 0)
+
+    def set_context(name, entry):
+        """Give an existing row this batch's event and date; False on a settings error."""
+        stale = {key: value for key, value in context.items() if entry.get(key) != value}
+        if not stale:
+            return True
+        try:
+            tag(page_id_of(entry), stale)
+        except CardError as error:
+            counts["failed"] += 1
+            out(f"✗ {name}: 学会・日付を設定できませんでした: {error}")
+            return error.status != 422
+        counts["tagged"] += 1
+        entry.update(stale)
+        save_ledger(ledger_path, ledger)
+        out(f"＋ {name}: 学会・日付を設定 {entry.get('card', {}).get('name', '')}")
+        return True
+
     seen = set()
-    for path in images:
+    processed = 0
+    for path in find_images(inbox):
         digest = file_sha256(path)
-        entry = ledger.get(digest, {})
-        backfill = (not dry_run and not retry and entry.get("status") == "created"
-                    and not entry.get("body") and page_id_of(entry))
-        if digest in seen or (entry.get("status") in DONE_STATES and not retry and not backfill):
+        name = path.relative_to(inbox)
+        if digest in seen:
             counts["skipped"] += 1
             continue
-        if limit is not None and len(seen) >= limit:
+        entry = ledger.get(digest, {})
+        existing = (not dry_run and not retry and entry.get("status") == "created"
+                    and page_id_of(entry))
+        if entry.get("status") in DONE_STATES and not retry and not (existing and not entry.get("body")):
+            seen.add(digest)
+            counts["skipped"] += 1
+            if existing and not set_context(name, entry):
+                break
+            continue
+        if limit is not None and processed >= limit:
             counts["left"] += 1
             continue
         seen.add(digest)
-        name = path.relative_to(inbox)
+        processed += 1
         try:
             raw_card, full_text = reader.read(path, digest)
             card, dropped = clean_card(raw_card)
             attachment = None if dry_run else (load_jpeg(path), f"{path.stem}.jpg", full_text)
         except CardError as error:
-            if backfill:
-                out(f"✗ {name}: 写真と全文を追加できませんでした: {error}")
-                counts["failed"] += 1
-                continue
             counts["failed"] += 1
+            if existing:
+                out(f"✗ {name}: 写真と全文を追加できませんでした: {error}")
+                continue
             out(f"✗ {name}: {error}")
             if not dry_run:
                 ledger[digest] = {"file": str(name), "status": "failed", "error": str(error),
@@ -243,7 +270,8 @@ def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None,
             for line in full_text.splitlines() or ["（なし）"]:
                 out(f"      {line}")
             continue
-        if backfill:
+        if existing:
+            # A row created before page bodies existed: add the photo and text once.
             try:
                 attach(page_id_of(entry), attachment)
             except CardError as error:
@@ -254,9 +282,11 @@ def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None,
             entry["body"] = True
             save_ledger(ledger_path, ledger)
             out(f"＋ {name}: 既存のページに写真と全文を追加 {summary}\n    {entry.get('url')}")
+            if not set_context(name, entry):
+                break
             continue
         try:
-            status, url, page_id = register(card, attachment)
+            status, url, page_id = register(card, attachment, context)
         except CardError as error:
             status = "uncertain" if "登録結果を確認できませんでした" in str(error) else "failed"
             out(f"✗ {name}: {error}")
@@ -275,8 +305,17 @@ def sync(inbox, data_dir, reader, dry_run=False, retry=False, limit=None,
         counts[status] += 1
         ledger[digest] = {"file": str(name), "status": status, "url": url, "page_id": page_id,
                           "body": status == "created", "card": card, "at": now()}
+        if status == "created":
+            ledger[digest].update(context)
         save_ledger(ledger_path, ledger)
     return counts
+
+
+def parse_date(value):
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError("YYYY-MM-DD の形で指定してください（例 2026-11-14）。") from None
 
 
 def now():
@@ -290,12 +329,19 @@ def main(argv=None):
     parser.add_argument("--model", default=DEFAULT_MODEL, help="mlx-vlm のモデル名")
     parser.add_argument("--dry-run", action="store_true", help="読み取り結果を表示するだけで Notion に送らない")
     parser.add_argument("--retry", action="store_true", help="登録済みの画像も含めてもう一度処理する")
+    parser.add_argument("--event", help="名刺をもらった学会・イベントの名前（今回の画像すべてに付ける）")
+    parser.add_argument("--date", type=parse_date, help="名刺をもらった日（YYYY-MM-DD）")
     parser.add_argument("--limit", type=int, help="新しい画像のうち、先頭から指定した枚数だけ処理する")
     parser.add_argument("--check", action="store_true",
                         help="画像・モデル・Notion の準備を確かめるだけで、読み取りも登録もしない")
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit は1以上にしてください。")
+    if args.event is not None:
+        args.event = args.event.strip()
+        # Notion select option names cannot contain commas.
+        if not args.event or "," in args.event or len(args.event) > 100:
+            parser.error("--event は100文字以内で、半角カンマを含めないでください。")
     if args.check:
         return check(args)
 
@@ -306,7 +352,7 @@ def main(argv=None):
     reader = QwenReader(args.model, args.data / "vlm_cache")
     try:
         counts = sync(args.inbox, args.data, reader, dry_run=args.dry_run, retry=args.retry,
-                      limit=args.limit)
+                      limit=args.limit, context={"event": args.event, "met_on": args.date})
     except CardError as error:
         print(f"✗ {error}", file=sys.stderr)
         return 1
@@ -315,7 +361,7 @@ def main(argv=None):
               "（Notion には送っていません）")
     else:
         print(f"\n登録 {counts['created']} 件、写真と全文を追加 {counts['attached']} 件、"
-              f"登録済み {counts['duplicate']} 件、"
+              f"学会・日付を設定 {counts['tagged']} 件、登録済み {counts['duplicate']} 件、"
               f"失敗 {counts['failed']} 件、結果不明 {counts['uncertain']} 件、"
               f"処理済みで省略 {counts['skipped']} 件")
         if counts["uncertain"]:
@@ -355,12 +401,15 @@ def check(args):
         print(f"✓ モデル: {args.model}" + ("" if cached else "（未ダウンロード。初回の読み取りで取得します）"))
 
     try:
-        columns = check_notion()
+        columns, present = check_notion()
     except CardError as error:
         ready = False
         print(f"✗ Notion: {error}")
     else:
-        print(f"✓ Notion: 登録先と {len(columns)} 列を確認しました（書き込みはしていません）")
+        print(f"✓ Notion: 登録先と {len(FIELDS)} 列を確認しました（書き込みはしていません）")
+        missing = [columns[field] for field, ok in present.items() if not ok]
+        if missing:
+            print(f"  「{'」「'.join(missing)}」列がありません。--event・--date を使う前に作ってください。")
     print("\n準備ができています。" if ready else "\n✗ の項目を直してから、もう一度 --check を実行してください。")
     return 0 if ready else 1
 

@@ -52,7 +52,7 @@ class SyncTest(unittest.TestCase):
         })
         saved = []
 
-        def register(value, attachment):
+        def register(value, attachment, context):
             saved.append(value)
             jpeg, filename, full_text = attachment
             self.assertTrue(jpeg.startswith(b"\xff\xd8"))
@@ -76,7 +76,7 @@ class SyncTest(unittest.TestCase):
         self.image("blank.jpg", "black")
         reader = FakeReader({"a.jpg": card(company="架空商事"), "blank.jpg": card(name="")})
 
-        def register(_value, _attachment):
+        def register(_value, _attachment, _context):
             raise AssertionError("dry run must not register")
 
         counts = self.run_sync(reader, register, dry_run=True)
@@ -85,9 +85,9 @@ class SyncTest(unittest.TestCase):
         self.assertIn("    会社名: 架空商事", self.lines)
         self.assertIn("      全文", self.lines)
 
-        counts = self.run_sync(reader, lambda value, attachment: ("created", "https://notion.so/new", "new-id"))
+        counts = self.run_sync(reader, lambda value, attachment, context: ("created", "https://notion.so/new", "new-id"))
         self.assertEqual((counts["created"], counts["failed"]), (1, 1))
-        counts = self.run_sync(reader, lambda value, attachment: ("created", "https://notion.so/new", "new-id"))
+        counts = self.run_sync(reader, lambda value, attachment, context: ("created", "https://notion.so/new", "new-id"))
         self.assertEqual((counts["skipped"], counts["failed"]), (1, 1))
 
     def test_settings_error_stops_and_uncertain_create_is_not_retried(self):
@@ -95,14 +95,14 @@ class SyncTest(unittest.TestCase):
         self.image("b.jpg", "gray")
         reader = FakeReader({"a.jpg": card(), "b.jpg": card(name="佐藤 一郎")})
 
-        def broken(_value, _attachment):
+        def broken(_value, _attachment, _context):
             raise CardError("notion.local.json に登録先のデータソース ID と列名を設定してください。", 503)
 
         counts = self.run_sync(reader, broken)
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(len(reader.calls), 1)
 
-        def lost(_value, _attachment):
+        def lost(_value, _attachment, _context):
             raise CardError("登録結果を確認できませんでした。Notion で登録済みか確かめてから再試行してください。", 502)
 
         counts = self.run_sync(reader, lost)
@@ -114,7 +114,7 @@ class SyncTest(unittest.TestCase):
         for index, color in enumerate(("white", "gray", "black")):
             self.image(f"{index}.jpg", color)
         reader = FakeReader({f"{index}.jpg": card(name=f"名前{index}") for index in range(3)})
-        register = lambda value, attachment: ("created", "https://notion.so/new", "new-id")
+        register = lambda value, attachment, context: ("created", "https://notion.so/new", "new-id")
 
         counts = self.run_sync(reader, register, limit=2)
         self.assertEqual((counts["created"], counts["left"]), (2, 1))
@@ -133,7 +133,7 @@ class SyncTest(unittest.TestCase):
         reader = FakeReader({"a.jpg": card()})
         attached = []
 
-        def register(_value, _attachment):
+        def register(_value, _attachment, _context):
             raise AssertionError("existing rows must not be created again")
 
         def attach(page_id, attachment):
@@ -144,6 +144,33 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(attached, [(page, "a.jpg", "山田 花子\n全文")])
         counts = self.run_sync(reader, register, attach=attach)
         self.assertEqual((counts["skipped"], len(attached)), (1, 1))
+
+    def test_event_and_date_go_to_new_rows_and_label_existing_ones_once(self):
+        self.image("a.jpg", "white")
+        reader = FakeReader({"a.jpg": card(), "b.jpg": card(name="佐藤 一郎")})
+        given = []
+
+        def register(_value, _attachment, context):
+            given.append(context)
+            return "created", "https://notion.so/41b227d008f181d2a577f0677a51d812", "page-a"
+
+        tagged = []
+        tag = lambda page_id, context: tagged.append((page_id, context))
+        self.run_sync(reader, register, tag=tag)
+        self.assertEqual(given, [{}])
+
+        self.image("b.jpg", "gray")
+        event = {"event": "CBI学会2026", "met_on": "2026-11-14"}
+        counts = self.run_sync(reader, register, tag=tag, context=event)
+        self.assertEqual((counts["created"], counts["tagged"]), (1, 1))
+        self.assertEqual(given[-1], event)
+        self.assertEqual(tagged, [("page-a", event)])
+
+        counts = self.run_sync(reader, register, tag=tag, context=event)
+        self.assertEqual((counts["tagged"], len(tagged)), (0, 1))
+        counts = self.run_sync(reader, register, tag=tag, context={"event": "別の学会"})
+        self.assertEqual(counts["tagged"], 2)
+        self.assertEqual(tagged[-1][1], {"event": "別の学会"})
 
 
 class CheckNotionTest(unittest.TestCase):
@@ -164,7 +191,8 @@ class CheckNotionTest(unittest.TestCase):
         factory = partial(httpx.Client, transport=httpx.MockTransport(notion))
         environment = {"NOTION_TOKEN": "test", "NOTION_DATA_SOURCE_ID": "0b4595fd-a02d-4b71-95c5-0c482316cc45"}
         with patch("app.httpx.Client", side_effect=factory), patch.dict("os.environ", environment):
-            self.assertEqual(len(check_notion()), len(FIELDS))
+            columns, present = check_notion()
+            self.assertEqual(present, {"event": False, "met_on": False})
             schema["メール"] = {"type": "rich_text"}
             with self.assertRaisesRegex(CardError, "メール"):
                 check_notion()
@@ -210,6 +238,20 @@ class AttachmentTest(unittest.TestCase):
         self.assertEqual([path for _, path in calls], [
             "/v1/data_sources/0b4595fd-a02d-4b71-95c5-0c482316cc45",
             "/v1/file_uploads", "/v1/file_uploads/upload-1/send", "/v1/pages"])
+
+
+class ContextPropertyTest(unittest.TestCase):
+    def test_select_date_and_missing_column(self):
+        from app import context_properties
+
+        columns = {"event": "学会", "met_on": "日付"}
+        schema = {"学会": {"type": "select"}, "日付": {"type": "date"}}
+        self.assertEqual(
+            context_properties(schema, columns, {"event": "CBI学会2026", "met_on": "2026-11-14"}),
+            {"学会": {"select": {"name": "CBI学会2026"}}, "日付": {"date": {"start": "2026-11-14"}}})
+        self.assertEqual(context_properties(schema, columns, None), {})
+        with self.assertRaisesRegex(CardError, "日付"):
+            context_properties({}, columns, {"met_on": "2026-11-14"})
 
 
 class ParseTest(unittest.TestCase):
